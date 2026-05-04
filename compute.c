@@ -1,49 +1,71 @@
 #include <stdlib.h>
 #include <math.h>
+#include <cuda_runtime.h>
 #include "vector.h"
 #include "config.h"
 
-//compute: Updates the positions and locations of the objects in the system based on gravity.
-//Parameters: None
-//Returns: None
-//Side Effect: Modifies the hPos and hVel arrays with the new positions and accelerations after 1 INTERVAL
-void compute(){
-	//make an acceleration matrix which is NUMENTITIES squared in size;
-	int i,j,k;
-	vector3* values=(vector3*)malloc(sizeof(vector3)*NUMENTITIES*NUMENTITIES);
-	vector3** accels=(vector3**)malloc(sizeof(vector3*)*NUMENTITIES);
-	for (i=0;i<NUMENTITIES;i++)
-		accels[i]=&values[i*NUMENTITIES];
-	//first compute the pairwise accelerations.  Effect is on the first argument.
-	for (i=0;i<NUMENTITIES;i++){
-		for (j=0;j<NUMENTITIES;j++){
-			if (i==j) {
-				FILL_VECTOR(accels[i][j],0,0,0);
-			}
-			else{
-				vector3 distance;
-				for (k=0;k<3;k++) distance[k]=hPos[i][k]-hPos[j][k];
-				double magnitude_sq=distance[0]*distance[0]+distance[1]*distance[1]+distance[2]*distance[2];
-				double magnitude=sqrt(magnitude_sq);
-				double accelmag=-1*GRAV_CONSTANT*mass[j]/magnitude_sq;
-				FILL_VECTOR(accels[i][j],accelmag*distance[0]/magnitude,accelmag*distance[1]/magnitude,accelmag*distance[2]/magnitude);
-			}
-		}
-	}
-	//sum up the rows of our matrix to get effect on each entity, then update velocity and position.
-	for (i=0;i<NUMENTITIES;i++){
-		vector3 accel_sum={0,0,0};
-		for (j=0;j<NUMENTITIES;j++){
-			for (k=0;k<3;k++)
-				accel_sum[k]+=accels[i][j][k];
-		}
-		//compute the new velocity based on the acceleration and time interval
-		//compute the new position based on the velocity and time interval
-		for (k=0;k<3;k++){
-			hVel[i][k]+=accel_sum[k]*INTERVAL;
-			hPos[i][k]+=hVel[i][k]*INTERVAL;
-		}
-	}
-	free(accels);
-	free(values);
+__global__ void computeKernel(vector3 *pos, vector3 *vel, double *mass) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= NUMENTITIES) return;
+
+    double ax = 0.0;
+    double ay = 0.0;
+    double az = 0.0;
+
+    for (int j = 0; j < NUMENTITIES; j++) {
+        if (i != j) {
+            double dx = pos[i][0] - pos[j][0];
+            double dy = pos[i][1] - pos[j][1];
+            double dz = pos[i][2] - pos[j][2];
+
+            double magnitude_sq = dx * dx + dy * dy + dz * dz;
+            double magnitude = sqrt(magnitude_sq);
+            double accelmag = -1.0 * GRAV_CONSTANT * mass[j] / magnitude_sq;
+
+            ax += accelmag * dx / magnitude;
+            ay += accelmag * dy / magnitude;
+            az += accelmag * dz / magnitude;
+        }
+    }
+
+    vel[i][0] += ax * INTERVAL;
+    vel[i][1] += ay * INTERVAL;
+    vel[i][2] += az * INTERVAL;
+
+    pos[i][0] += vel[i][0] * INTERVAL;
+    pos[i][1] += vel[i][1] * INTERVAL;
+    pos[i][2] += vel[i][2] * INTERVAL;
+}
+
+void compute() {
+    static vector3 *dPos = NULL;
+    static vector3 *dVel = NULL;
+    static double *dMass = NULL;
+    static int initialized = 0;
+
+    size_t vecSize = sizeof(vector3) * NUMENTITIES;
+    size_t massSize = sizeof(double) * NUMENTITIES;
+
+    if (!initialized) {
+        cudaMalloc(&dPos, vecSize);
+        cudaMalloc(&dVel, vecSize);
+        cudaMalloc(&dMass, massSize);
+
+        cudaMemcpy(dMass, mass, massSize, cudaMemcpyHostToDevice);
+
+        initialized = 1;
+    }
+
+    cudaMemcpy(dPos, hPos, vecSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(dVel, hVel, vecSize, cudaMemcpyHostToDevice);
+
+    int threads = 256;
+    int blocks = (NUMENTITIES + threads - 1) / threads;
+
+    computeKernel<<<blocks, threads>>>(dPos, dVel, dMass);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(hPos, dPos, vecSize, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hVel, dVel, vecSize, cudaMemcpyDeviceToHost);
 }
